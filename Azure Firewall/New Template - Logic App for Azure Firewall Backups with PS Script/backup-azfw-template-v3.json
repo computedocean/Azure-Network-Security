@@ -1,0 +1,834 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "3.0.0.0",
+    "parameters": {
+        "Playbook_Name": {
+            "defaultValue": "BackUp-AzFW",
+            "type": "String",
+            "metadata": {
+                "displayName": "Logic App Name",
+                "description": "Name of the Logic App that runs the Azure Firewall backup process"
+            }
+        },
+        "Storage_Account_Name": {
+            "defaultValue": "fwbackups",
+            "type": "String",
+            "metadata": {
+                "displayName": "Storage Account Name",
+                "description": "Name of the Storage Account to store backups (can be behind a firewall with Managed Identity)"
+            }
+        },
+        "Firewall_Name": {
+            "defaultValue": "",
+            "type": "String",
+            "metadata": {
+                "displayName": "Azure Firewall Name",
+                "description": "Name of the Azure Firewall to backup"
+            }
+        },
+        "Firewall_Policy_Name": {
+            "defaultValue": "",
+            "type": "String",
+            "metadata": {
+                "displayName": "Azure Firewall Policy Name",
+                "description": "Name of the Azure Firewall Policy to backup"
+            }
+        },
+        "Subscription_Id": {
+            "defaultValue": "[subscription().subscriptionId]",
+            "type": "String",
+            "metadata": {
+                "displayName": "Firewall Subscription ID",
+                "description": "Subscription ID hosting the Azure Firewall and Policy"
+            }
+        },
+        "Firewall_Resource_Group_Name": {
+            "defaultValue": "",
+            "type": "String",
+            "metadata": {
+                "displayName": "Firewall Resource Group",
+                "description": "Resource Group hosting the Azure Firewall"
+            }
+        },
+        "Policy_Resource_Group_Name": {
+            "defaultValue": "",
+            "type": "String",
+            "metadata": {
+                "displayName": "Policy Resource Group (leave empty if same as Firewall RG)",
+                "description": "Resource Group hosting the Firewall Policy. Leave empty if it is the same as the Firewall Resource Group."
+            }
+        },
+        "Backup_Frequency_Days": {
+            "defaultValue": 3,
+            "type": "Int",
+            "metadata": {
+                "displayName": "Backup Frequency (Days)",
+                "description": "How often (in days) the backup should run"
+            }
+        },
+        "Backup_Start_Time": {
+            "defaultValue": "2024-01-01T02:00:00Z",
+            "type": "String",
+            "metadata": {
+                "displayName": "Backup Start Time (UTC)",
+                "description": "The time of day (UTC) when the backup runs. Format: yyyy-MM-ddTHH:mm:ssZ"
+            }
+        },
+        "Retention_Days": {
+            "defaultValue": 30,
+            "type": "Int",
+            "metadata": {
+                "displayName": "Backup Retention (Days)",
+                "description": "Number of days to retain backup files before auto-deletion"
+            }
+        },
+        "Enable_Write_Trigger": {
+            "defaultValue": false,
+            "type": "Bool",
+            "metadata": {
+                "displayName": "Trigger backup on every write operation",
+                "description": "When enabled, deploys an Activity Log Alert that triggers a backup on ANY change to the Azure Firewall Policy or its child resources - matched by the Microsoft.Network/firewallPolicies operation namespace (base policy, rule collection groups, drafts, draft deploys, IDPS signature overrides, deletes, and any future operations)."
+            }
+        },
+        "Write_Trigger_Cooldown_Minutes": {
+            "defaultValue": 5,
+            "type": "Int",
+            "metadata": {
+                "displayName": "Write Trigger Cooldown (Minutes)",
+                "description": "Minimum minutes between write-triggered backups to avoid rapid-fire backups during bulk changes. Only applies when Write Trigger is enabled."
+            }
+        }
+    },
+    "variables": {
+        "policyRG": "[if(empty(parameters('Policy_Resource_Group_Name')), parameters('Firewall_Resource_Group_Name'), parameters('Policy_Resource_Group_Name'))]",
+        "storageAccountId": "[resourceId('Microsoft.Storage/storageAccounts', parameters('Storage_Account_Name'))]",
+        "onWriteLogicAppName": "[concat(parameters('Playbook_Name'), '-OnWrite')]",
+        "actionGroupName": "[concat(parameters('Playbook_Name'), '-AG')]",
+        "alertName": "[concat(parameters('Playbook_Name'), '-WriteAlert')]",
+        "firewallResourceId": "[concat('/subscriptions/', parameters('Subscription_Id'), '/resourceGroups/', parameters('Firewall_Resource_Group_Name'), '/providers/Microsoft.Network/azureFirewalls/', parameters('Firewall_Name'))]",
+        "policyResourceId": "[concat('/subscriptions/', parameters('Subscription_Id'), '/resourceGroups/', variables('policyRG'), '/providers/Microsoft.Network/firewallPolicies/', parameters('Firewall_Policy_Name'))]",
+        "policyRGScope": "[concat('/subscriptions/', parameters('Subscription_Id'), '/resourceGroups/', variables('policyRG'))]",
+        "backupWorkflowParameters": {
+            "subscriptionId": {
+                "defaultValue": "[parameters('Subscription_Id')]",
+                "type": "String"
+            },
+            "firewallResourceGroup": {
+                "defaultValue": "[parameters('Firewall_Resource_Group_Name')]",
+                "type": "String"
+            },
+            "policyResourceGroup": {
+                "defaultValue": "[variables('policyRG')]",
+                "type": "String"
+            },
+            "firewallName": {
+                "defaultValue": "[parameters('Firewall_Name')]",
+                "type": "String"
+            },
+            "firewallPolicyName": {
+                "defaultValue": "[parameters('Firewall_Policy_Name')]",
+                "type": "String"
+            },
+            "storageAccountName": {
+                "defaultValue": "[parameters('Storage_Account_Name')]",
+                "type": "String"
+            }
+        },
+        "backupWorkflowActions": {
+            "Export_Firewall_Template": {
+                "runAfter": {},
+                "type": "Http",
+                "inputs": {
+                    "authentication": {
+                        "type": "ManagedServiceIdentity"
+                    },
+                    "body": {
+                        "options": "IncludeParameterDefaultValue",
+                        "resources": [
+                            "/subscriptions/@{parameters('subscriptionId')}/resourceGroups/@{parameters('policyResourceGroup')}/providers/Microsoft.Network/firewallPolicies/@{parameters('firewallPolicyName')}"
+                        ]
+                    },
+                    "method": "POST",
+                    "uri": "https://management.azure.com/subscriptions/@{parameters('subscriptionId')}/resourcegroups/@{parameters('policyResourceGroup')}/exportTemplate?api-version=2021-04-01"
+                }
+            },
+            "Check_Export_Success": {
+                "runAfter": {
+                    "Export_Firewall_Template": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "If",
+                "expression": {
+                    "and": [
+                        {
+                            "equals": [
+                                "@outputs('Export_Firewall_Template')['statusCode']",
+                                200
+                            ]
+                        }
+                    ]
+                },
+                "actions": {
+                    "Parse_Template": {
+                        "runAfter": {},
+                        "type": "ParseJson",
+                        "inputs": {
+                            "content": "@body('Export_Firewall_Template')?['template']",
+                            "schema": {
+                                "type": "object"
+                            }
+                        }
+                    },
+                    "Filter_RuleCollectionGroups": {
+                        "runAfter": {
+                            "Parse_Template": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Query",
+                        "inputs": {
+                            "from": "@body('Parse_Template')?['resources']",
+                            "where": "@equals(item()?['type'], 'Microsoft.Network/firewallPolicies/ruleCollectionGroups')"
+                        }
+                    },
+                    "Filter_Other_Resources": {
+                        "runAfter": {
+                            "Parse_Template": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Query",
+                        "inputs": {
+                            "from": "@body('Parse_Template')?['resources']",
+                            "where": "@and(not(equals(item()?['type'], 'Microsoft.Network/firewallPolicies/ruleCollectionGroups')), not(equals(item()?['type'], 'Microsoft.Network/azureFirewalls')))"
+                        }
+                    },
+                    "Extract_Policy_Param": {
+                        "runAfter": {
+                            "Filter_RuleCollectionGroups": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@if(empty(body('Filter_RuleCollectionGroups')), '', first(split(replace(first(body('Filter_RuleCollectionGroups'))?['name'], '[concat(parameters(''', ''), '''')))",
+                        "description": "Extract the policy parameter name from the first RCG name"
+                    },
+                    "Build_Sequential_DependsOn": {
+                        "runAfter": {
+                            "Extract_Policy_Param": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Select",
+                        "inputs": {
+                            "from": "@range(0, length(body('Filter_RuleCollectionGroups')))",
+                            "select": {
+                                "apiVersion": "@body('Filter_RuleCollectionGroups')[item()]?['apiVersion']",
+                                "type": "@body('Filter_RuleCollectionGroups')[item()]?['type']",
+                                "name": "@body('Filter_RuleCollectionGroups')[item()]?['name']",
+                                "location": "@body('Filter_RuleCollectionGroups')[item()]?['location']",
+                                "properties": "@body('Filter_RuleCollectionGroups')[item()]?['properties']",
+                                "dependsOn": "@if(equals(item(), 0), createArray(concat('[resourceId(''Microsoft.Network/firewallPolicies'', parameters(''', outputs('Extract_Policy_Param'), '''))]')), createArray(concat('[resourceId(''Microsoft.Network/firewallPolicies/ruleCollectionGroups'', parameters(''', outputs('Extract_Policy_Param'), '''), ''', replace(last(split(body('Filter_RuleCollectionGroups')[sub(item(),1)]?['name'], '''/')), ''')]', ''), ''')]')))"
+                            }
+                        },
+                        "description": "Chain each RCG sequentially to avoid race conditions"
+                    },
+                    "Compose_Fixed_Template": {
+                        "runAfter": {
+                            "Build_Sequential_DependsOn": [
+                                "Succeeded"
+                            ],
+                            "Filter_Other_Resources": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": {
+                            "$schema": "@body('Parse_Template')?['$schema']",
+                            "contentVersion": "@body('Parse_Template')?['contentVersion']",
+                            "parameters": "@body('Parse_Template')?['parameters']",
+                            "variables": "@body('Parse_Template')?['variables']",
+                            "resources": "@union(body('Filter_Other_Resources'), body('Build_Sequential_DependsOn'))",
+                            "outputs": "@body('Parse_Template')?['outputs']"
+                        }
+                    },
+                    "Store_Backup_To_Blob": {
+                        "runAfter": {
+                            "Compose_Fixed_Template": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Http",
+                        "inputs": {
+                            "authentication": {
+                                "type": "ManagedServiceIdentity",
+                                "audience": "https://storage.azure.com/"
+                            },
+                            "body": "@outputs('Compose_Fixed_Template')",
+                            "headers": {
+                                "Content-Type": "application/json",
+                                "x-ms-blob-type": "BlockBlob",
+                                "x-ms-version": "2021-08-06"
+                            },
+                            "method": "PUT",
+                            "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net/firewall-backups/backup-@{parameters('firewallName')}-@{formatDateTime(utcNow(), 'yyyy-MM-dd-HHmmss')}.json"
+                        }
+                    }
+                },
+                "else": {
+                    "actions": {
+                        "Export_Failed": {
+                            "runAfter": {},
+                            "type": "Terminate",
+                            "inputs": {
+                                "runError": {
+                                    "code": "ExportFailed",
+                                    "message": "Failed to export Azure Firewall template. HTTP Status: @{outputs('Export_Firewall_Template')['statusCode']}. Response: @{body('Export_Firewall_Template')}"
+                                },
+                                "runStatus": "Failed"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "apiVersion": "2023-01-01",
+            "name": "[parameters('Storage_Account_Name')]",
+            "location": "[resourceGroup().location]",
+            "sku": {
+                "name": "Standard_LRS",
+                "tier": "Standard"
+            },
+            "kind": "StorageV2",
+            "properties": {
+                "defaultToOAuthAuthentication": true,
+                "publicNetworkAccess": "Disabled",
+                "allowBlobPublicAccess": false,
+                "allowSharedKeyAccess": false,
+                "minimumTlsVersion": "TLS1_2",
+                "networkAcls": {
+                    "bypass": "AzureServices",
+                    "virtualNetworkRules": [],
+                    "ipRules": [],
+                    "defaultAction": "Deny"
+                },
+                "supportsHttpsTrafficOnly": true,
+                "encryption": {
+                    "requireInfrastructureEncryption": false,
+                    "services": {
+                        "blob": {
+                            "keyType": "Account",
+                            "enabled": true
+                        }
+                    },
+                    "keySource": "Microsoft.Storage"
+                },
+                "accessTier": "Hot"
+            }
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts/blobServices",
+            "apiVersion": "2023-01-01",
+            "name": "[concat(parameters('Storage_Account_Name'), '/default')]",
+            "dependsOn": [
+                "[variables('storageAccountId')]"
+            ],
+            "properties": {
+                "deleteRetentionPolicy": {
+                    "allowPermanentDelete": false,
+                    "enabled": true,
+                    "days": 7
+                },
+                "containerDeleteRetentionPolicy": {
+                    "enabled": true,
+                    "days": 7
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+            "apiVersion": "2023-01-01",
+            "name": "[concat(parameters('Storage_Account_Name'), '/default/firewall-backups')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('Storage_Account_Name'), 'default')]",
+                "[variables('storageAccountId')]"
+            ],
+            "properties": {
+                "publicAccess": "None"
+            }
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts/managementPolicies",
+            "apiVersion": "2023-01-01",
+            "name": "[concat(parameters('Storage_Account_Name'), '/default')]",
+            "dependsOn": [
+                "[variables('storageAccountId')]"
+            ],
+            "properties": {
+                "policy": {
+                    "rules": [
+                        {
+                            "name": "DeleteOldBackups",
+                            "enabled": true,
+                            "type": "Lifecycle",
+                            "definition": {
+                                "filters": {
+                                    "blobTypes": ["blockBlob"],
+                                    "prefixMatch": ["firewall-backups/"]
+                                },
+                                "actions": {
+                                    "baseBlob": {
+                                        "delete": {
+                                            "daysAfterModificationGreaterThan": "[parameters('Retention_Days')]"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        {
+            "comments": "Scheduled backup Logic App — runs on recurrence",
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2019-05-01",
+            "name": "[parameters('Playbook_Name')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('Storage_Account_Name'), 'default', 'firewall-backups')]"
+            ],
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": "[variables('backupWorkflowParameters')]",
+                    "triggers": {
+                        "Recurrence": {
+                            "recurrence": {
+                                "frequency": "Day",
+                                "interval": "[parameters('Backup_Frequency_Days')]",
+                                "startTime": "[parameters('Backup_Start_Time')]"
+                            },
+                            "type": "Recurrence"
+                        }
+                    },
+                    "actions": "[variables('backupWorkflowActions')]",
+                    "outputs": {}
+                },
+                "parameters": {}
+            }
+        },
+        {
+            "comments": "Write-triggered backup Logic App — fires on Activity Log write events. Conditionally deployed.",
+            "type": "Microsoft.Logic/workflows",
+            "apiVersion": "2019-05-01",
+            "name": "[variables('onWriteLogicAppName')]",
+            "location": "[resourceGroup().location]",
+            "condition": "[parameters('Enable_Write_Trigger')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('Storage_Account_Name'), 'default', 'firewall-backups')]"
+            ],
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "state": "Enabled",
+                "definition": {
+                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                        "subscriptionId": {
+                            "defaultValue": "[parameters('Subscription_Id')]",
+                            "type": "String"
+                        },
+                        "firewallResourceGroup": {
+                            "defaultValue": "[parameters('Firewall_Resource_Group_Name')]",
+                            "type": "String"
+                        },
+                        "policyResourceGroup": {
+                            "defaultValue": "[variables('policyRG')]",
+                            "type": "String"
+                        },
+                        "firewallName": {
+                            "defaultValue": "[parameters('Firewall_Name')]",
+                            "type": "String"
+                        },
+                        "firewallPolicyName": {
+                            "defaultValue": "[parameters('Firewall_Policy_Name')]",
+                            "type": "String"
+                        },
+                        "storageAccountName": {
+                            "defaultValue": "[parameters('Storage_Account_Name')]",
+                            "type": "String"
+                        },
+                        "cooldownMinutes": {
+                            "defaultValue": "[parameters('Write_Trigger_Cooldown_Minutes')]",
+                            "type": "Int"
+                        }
+                    },
+                    "triggers": {
+                        "manual": {
+                            "type": "Request",
+                            "kind": "Http",
+                            "runtimeConfiguration": {
+                                "concurrency": {
+                                    "runs": 1
+                                }
+                            },
+                            "inputs": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "schemaId": { "type": "string" },
+                                        "data": {
+                                            "type": "object",
+                                            "properties": {
+                                                "essentials": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "alertId": { "type": "string" },
+                                                        "alertRule": { "type": "string" },
+                                                        "severity": { "type": "string" },
+                                                        "signalType": { "type": "string" },
+                                                        "monitorCondition": { "type": "string" },
+                                                        "firedDateTime": { "type": "string" },
+                                                        "description": { "type": "string" }
+                                                    }
+                                                },
+                                                "alertContext": { "type": "object" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "actions": {
+                        "Check_Cooldown": {
+                            "runAfter": {},
+                            "type": "Http",
+                            "inputs": {
+                                "authentication": {
+                                    "type": "ManagedServiceIdentity",
+                                    "audience": "https://storage.azure.com/"
+                                },
+                                "method": "GET",
+                                "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net/firewall-backups?restype=container&comp=list&prefix=backup-@{parameters('firewallName')}-",
+                                "headers": {
+                                    "x-ms-version": "2021-08-06"
+                                }
+                            }
+                        },
+                        "Parse_Last_Backup_Time": {
+                            "runAfter": {
+                                "Check_Cooldown": [
+                                    "Succeeded"
+                                ]
+                            },
+                            "type": "Compose",
+                            "inputs": "@xpath(xml(body('Check_Cooldown')), '//Last-Modified/text()')",
+                            "description": "Extract last backup timestamp to enforce cooldown"
+                        },
+                        "Evaluate_Cooldown": {
+                            "runAfter": {
+                                "Parse_Last_Backup_Time": [
+                                    "Succeeded"
+                                ]
+                            },
+                            "type": "If",
+                            "expression": {
+                                "or": [
+                                    {
+                                        "equals": [
+                                            "@length(outputs('Parse_Last_Backup_Time'))",
+                                            0
+                                        ]
+                                    },
+                                    {
+                                        "greater": [
+                                            "@div(sub(ticks(utcNow()), ticks(parseDateTime(last(outputs('Parse_Last_Backup_Time'))))), 600000000)",
+                                            "@parameters('cooldownMinutes')"
+                                        ]
+                                    }
+                                ]
+                            },
+                            "actions": {
+                                "Export_Firewall_Template": {
+                                    "runAfter": {},
+                                    "type": "Http",
+                                    "inputs": {
+                                        "authentication": {
+                                            "type": "ManagedServiceIdentity"
+                                        },
+                                        "body": {
+                                            "options": "IncludeParameterDefaultValue",
+                                            "resources": [
+                                                "/subscriptions/@{parameters('subscriptionId')}/resourceGroups/@{parameters('policyResourceGroup')}/providers/Microsoft.Network/firewallPolicies/@{parameters('firewallPolicyName')}"
+                                            ]
+                                        },
+                                        "method": "POST",
+                                        "uri": "https://management.azure.com/subscriptions/@{parameters('subscriptionId')}/resourcegroups/@{parameters('policyResourceGroup')}/exportTemplate?api-version=2021-04-01"
+                                    }
+                                },
+                                "Check_Export_Success": {
+                                    "runAfter": {
+                                        "Export_Firewall_Template": [
+                                            "Succeeded"
+                                        ]
+                                    },
+                                    "type": "If",
+                                    "expression": {
+                                        "and": [
+                                            {
+                                                "equals": [
+                                                    "@outputs('Export_Firewall_Template')['statusCode']",
+                                                    200
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "actions": {
+                                        "Parse_Template": {
+                                            "runAfter": {},
+                                            "type": "ParseJson",
+                                            "inputs": {
+                                                "content": "@body('Export_Firewall_Template')?['template']",
+                                                "schema": {
+                                                    "type": "object"
+                                                }
+                                            }
+                                        },
+                                        "Filter_RuleCollectionGroups": {
+                                            "runAfter": {
+                                                "Parse_Template": [
+                                                    "Succeeded"
+                                                ]
+                                            },
+                                            "type": "Query",
+                                            "inputs": {
+                                                "from": "@body('Parse_Template')?['resources']",
+                                                "where": "@equals(item()?['type'], 'Microsoft.Network/firewallPolicies/ruleCollectionGroups')"
+                                            }
+                                        },
+                                        "Filter_Other_Resources": {
+                                            "runAfter": {
+                                                "Parse_Template": [
+                                                    "Succeeded"
+                                                ]
+                                            },
+                                            "type": "Query",
+                                            "inputs": {
+                                                "from": "@body('Parse_Template')?['resources']",
+                                                "where": "@and(not(equals(item()?['type'], 'Microsoft.Network/firewallPolicies/ruleCollectionGroups')), not(equals(item()?['type'], 'Microsoft.Network/azureFirewalls')))"
+                                            }
+                                        },
+                                        "Extract_Policy_Param": {
+                                            "runAfter": {
+                                                "Filter_RuleCollectionGroups": [
+                                                    "Succeeded"
+                                                ]
+                                            },
+                                            "type": "Compose",
+                                            "inputs": "@if(empty(body('Filter_RuleCollectionGroups')), '', first(split(replace(first(body('Filter_RuleCollectionGroups'))?['name'], '[concat(parameters(''', ''), '''')))",
+                                            "description": "Extract the policy parameter name from the first RCG name"
+                                        },
+                                        "Build_Sequential_DependsOn": {
+                                            "runAfter": {
+                                                "Extract_Policy_Param": [
+                                                    "Succeeded"
+                                                ]
+                                            },
+                                            "type": "Select",
+                                            "inputs": {
+                                                "from": "@range(0, length(body('Filter_RuleCollectionGroups')))",
+                                                "select": {
+                                                    "apiVersion": "@body('Filter_RuleCollectionGroups')[item()]?['apiVersion']",
+                                                    "type": "@body('Filter_RuleCollectionGroups')[item()]?['type']",
+                                                    "name": "@body('Filter_RuleCollectionGroups')[item()]?['name']",
+                                                    "location": "@body('Filter_RuleCollectionGroups')[item()]?['location']",
+                                                    "properties": "@body('Filter_RuleCollectionGroups')[item()]?['properties']",
+                                                    "dependsOn": "@if(equals(item(), 0), createArray(concat('[resourceId(''Microsoft.Network/firewallPolicies'', parameters(''', outputs('Extract_Policy_Param'), '''))]')), createArray(concat('[resourceId(''Microsoft.Network/firewallPolicies/ruleCollectionGroups'', parameters(''', outputs('Extract_Policy_Param'), '''), ''', replace(last(split(body('Filter_RuleCollectionGroups')[sub(item(),1)]?['name'], '''/')), ''')]', ''), ''')]')))"
+                                                }
+                                            },
+                                            "description": "Chain each RCG sequentially to avoid race conditions"
+                                        },
+                                        "Compose_Fixed_Template": {
+                                            "runAfter": {
+                                                "Build_Sequential_DependsOn": [
+                                                    "Succeeded"
+                                                ],
+                                                "Filter_Other_Resources": [
+                                                    "Succeeded"
+                                                ]
+                                            },
+                                            "type": "Compose",
+                                            "inputs": {
+                                                "$schema": "@body('Parse_Template')?['$schema']",
+                                                "contentVersion": "@body('Parse_Template')?['contentVersion']",
+                                                "parameters": "@body('Parse_Template')?['parameters']",
+                                                "variables": "@body('Parse_Template')?['variables']",
+                                                "resources": "@union(body('Filter_Other_Resources'), body('Build_Sequential_DependsOn'))",
+                                                "outputs": "@body('Parse_Template')?['outputs']"
+                                            }
+                                        },
+                                        "Store_Backup_To_Blob": {
+                                            "runAfter": {
+                                                "Compose_Fixed_Template": [
+                                                    "Succeeded"
+                                                ]
+                                            },
+                                            "type": "Http",
+                                            "inputs": {
+                                                "authentication": {
+                                                    "type": "ManagedServiceIdentity",
+                                                    "audience": "https://storage.azure.com/"
+                                                },
+                                                "body": "@outputs('Compose_Fixed_Template')",
+                                                "headers": {
+                                                    "Content-Type": "application/json",
+                                                    "x-ms-blob-type": "BlockBlob",
+                                                    "x-ms-version": "2021-08-06"
+                                                },
+                                                "method": "PUT",
+                                                "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net/firewall-backups/backup-@{parameters('firewallName')}-@{formatDateTime(coalesce(triggerBody()?['data']?['alertContext']?['eventTimestamp'], utcNow()), 'yyyy-MM-dd-HHmmss')}.json"
+                                            }
+                                        }
+                                    },
+                                    "else": {
+                                        "actions": {
+                                            "Export_Failed": {
+                                                "runAfter": {},
+                                                "type": "Terminate",
+                                                "inputs": {
+                                                    "runError": {
+                                                        "code": "ExportFailed",
+                                                        "message": "Failed to export Azure Firewall template. HTTP Status: @{outputs('Export_Firewall_Template')['statusCode']}. Response: @{body('Export_Firewall_Template')}"
+                                                    },
+                                                    "runStatus": "Failed"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "else": {
+                                "actions": {
+                                    "Cooldown_Skip": {
+                                        "runAfter": {},
+                                        "type": "Terminate",
+                                        "inputs": {
+                                            "runStatus": "Cancelled"
+                                        },
+                                        "description": "Skipped — another backup ran within the cooldown window"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "outputs": {}
+                },
+                "parameters": {}
+            }
+        },
+        {
+            "comments": "Action Group that triggers the OnWrite Logic App when an Activity Log Alert fires",
+            "type": "Microsoft.Insights/actionGroups",
+            "apiVersion": "2023-01-01",
+            "name": "[variables('actionGroupName')]",
+            "location": "Global",
+            "condition": "[parameters('Enable_Write_Trigger')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Logic/workflows', variables('onWriteLogicAppName'))]"
+            ],
+            "properties": {
+                "groupShortName": "FWBackupAG",
+                "enabled": true,
+                "logicAppReceivers": [
+                    {
+                        "name": "TriggerFWBackup",
+                        "resourceId": "[resourceId('Microsoft.Logic/workflows', variables('onWriteLogicAppName'))]",
+                        "callbackUrl": "[if(parameters('Enable_Write_Trigger'), listCallbackUrl(resourceId('Microsoft.Logic/workflows/triggers', variables('onWriteLogicAppName'), 'manual'), '2019-05-01').value, 'https://placeholder')]",
+                        "useCommonAlertSchema": true
+                    }
+                ]
+            }
+        },
+        {
+            "comments": "Activity Log Alert — fires on write operations to the Firewall or Firewall Policy",
+            "type": "Microsoft.Insights/activityLogAlerts",
+            "apiVersion": "2020-10-01",
+            "name": "[variables('alertName')]",
+            "location": "Global",
+            "condition": "[parameters('Enable_Write_Trigger')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
+            ],
+            "properties": {
+                "scopes": [
+                    "[variables('policyRGScope')]"
+                ],
+                "enabled": true,
+                "description": "Triggers a backup on any change to the Azure Firewall Policy or its child resources (policy writes, rule collection group writes/deletes, draft writes, draft deploys, IDPS signature overrides, etc.) - matched by the Microsoft.Network/firewallPolicies operation namespace",
+                "condition": {
+                    "allOf": [
+                        {
+                            "field": "category",
+                            "equals": "Administrative"
+                        },
+                        {
+                            "anyOf": [
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/write" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/delete" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/deploy/action" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/ruleCollectionGroups/write" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/ruleCollectionGroups/delete" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/ruleGroups/write" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/ruleGroups/delete" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/firewallPolicyDrafts/write" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/firewallPolicyDrafts/delete" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/ruleCollectionGroups/ruleCollectionGroupDrafts/write" },
+                                { "field": "operationName", "equals": "Microsoft.Network/firewallPolicies/ruleCollectionGroups/ruleCollectionGroupDrafts/delete" }
+                            ]
+                        },
+                        {
+                            "field": "status",
+                            "equals": "Succeeded"
+                        }
+                    ]
+                },
+                "actions": {
+                    "actionGroups": [
+                        {
+                            "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
+                        }
+                    ]
+                }
+            }
+        }
+    ],
+    "outputs": {
+        "logicAppPrincipalId": {
+            "type": "String",
+            "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('Playbook_Name')), '2019-05-01', 'full').identity.principalId]"
+        },
+        "onWriteLogicAppPrincipalId": {
+            "condition": "[parameters('Enable_Write_Trigger')]",
+            "type": "String",
+            "value": "[if(parameters('Enable_Write_Trigger'), reference(resourceId('Microsoft.Logic/workflows', variables('onWriteLogicAppName')), '2019-05-01', 'full').identity.principalId, 'N/A')]"
+        },
+        "postDeploymentSteps": {
+            "type": "String",
+            "value": "[concat('Assign the following roles to the Logic App Managed Identity (Object ID shown above):\n1. Contributor on: /subscriptions/', parameters('Subscription_Id'), '/resourceGroups/', parameters('Firewall_Resource_Group_Name'), '\n2. Storage Blob Data Contributor on: ', variables('storageAccountId'), '\n\nAzure CLI:\naz role assignment create --assignee <principalId> --role \"Contributor\" --scope /subscriptions/', parameters('Subscription_Id'), '/resourceGroups/', parameters('Firewall_Resource_Group_Name'), '\naz role assignment create --assignee <principalId> --role \"Storage Blob Data Contributor\" --scope ', variables('storageAccountId'), if(parameters('Enable_Write_Trigger'), concat('\n\n--- WRITE TRIGGER (OnWrite Logic App) ---\nRepeat the same role assignments for the OnWrite Logic App principal ID.\naz role assignment create --assignee <onWritePrincipalId> --role \"Contributor\" --scope /subscriptions/', parameters('Subscription_Id'), '/resourceGroups/', parameters('Firewall_Resource_Group_Name'), '\naz role assignment create --assignee <onWritePrincipalId> --role \"Storage Blob Data Contributor\" --scope ', variables('storageAccountId')), ''))]"
+        }
+    }
+}

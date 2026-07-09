@@ -5,6 +5,7 @@
 # Updated: 3/6/2026 Modified to move away from direct REST API calls (413 payload limits / signatureOverrides route inconsistencies)
 #  and use Az modules (Az.Accounts + Az.Network).
 # Updated: 3/12/2026 Added parameters for Global Firewall mode and input file path, with prompts if not specified. Made progress reporting more granular and informative. Added error handling around API calls.
+# Updated: 4/1/2026 - Fixed issue with az.network module auto load
 #
 # requires a connect-azaccount first so we can get the token
 #
@@ -20,20 +21,20 @@
 # "9999999","ACTION"
 #
 # Signature and Action (Deny, Alert, Disabled)
-
+ 
 param(
     [Parameter(Mandatory = $false)]
     [string]$InputFile,
-
+ 
     # If not specified, script will leave the policy's global mode unchanged
     # Accepts: Off, Alert, Deny, Disabled (Disabled is normalized to Off)
     [Parameter(Mandatory = $false)]
     [ValidateSet("Off","Alert","Deny","Disabled")]
     [string]$GlobalMode
 )
-
+ 
 Write-Host 'Format should be CSV, with headers "signatureId", "mode"' -ForegroundColor Yellow
-
+ 
 # (Change #1) InputFile parameter: if not passed, prompt like before
 $input_file = $InputFile
 if ([string]::IsNullOrWhiteSpace($input_file)) {
@@ -43,7 +44,7 @@ if ([string]::IsNullOrWhiteSpace($input_file)) {
     Write-Host "`nNo filename specified. Exiting..." -ForegroundColor Red
     exit
 }
-
+ 
 # Get the Config Options from the config file
 $json = Get-Content -Path "ipsconfig.json" -Raw
 $config = $json | ConvertFrom-Json
@@ -53,58 +54,60 @@ $fwp = $config.fwp
 $location = $config.location
 $rcg = $config.rcg
 $fw = $config.fw
-
+ 
 # File needs to have at minimum a header with "signatureId","mode"
 # Set mode to Disabled, Alert, or Deny
 # if using the file from ipssigs.ps1 it will have more fields, but we only care about the first two
 $content = Import-Csv -Path $input_file -Header "signatureId","mode","extra1","extra2","extra3","extra4","extra5","extra6","extra7","extra8","extra9","extra10" | Select-Object -Skip 1
 # $content = Import-Csv -Path $input_file -Header "signatureId", "mode"
-
+ 
 Write-Host ("Processing Signature updates file - $input_file" ) -ForegroundColor Cyan
 Write-Host ("Rows read from CSV (including blanks that will be skipped): " + $content.Count) -ForegroundColor DarkGray
-
+ 
 # Pre-process CSV into compact objects (Id as UInt64, Mode normalized to Off/Alert/Deny)
 $items = $content | Where-Object {
     -not [string]::IsNullOrWhiteSpace($_.signatureId) -and -not [string]::IsNullOrWhiteSpace($_.mode)
 } | Select-Object `
     @{Name='Id';   Expression={[UInt64]$_.signatureId.Trim()}}, `
     @{Name='Mode'; Expression={ $m = $_.mode.Trim(); if ($m -ieq "Disabled") { "Off" } else { $m } }}
-
+ 
 $totalItems = $items.Count
 Write-Host ("Total signatures to upload (after filtering blanks): " + $totalItems) -ForegroundColor Yellow
-
+ 
 if ($totalItems -eq 0) {
     Write-Host "No valid signature rows found. Exiting..." -ForegroundColor Red
     exit
 }
-
+ 
 Write-Host "Building signature override objects (sequential, fast path)..." -ForegroundColor Cyan
 $progressId = 1
 Write-Progress -Id $progressId -Activity "Building signature override objects" -Status "Starting..." -PercentComplete 0
-
+ 
 $sig_overrides = New-Object System.Collections.Generic.List[object]
 $i = 0
 foreach ($it in $items) {
     $i++
-
-    $o = [Microsoft.Azure.Commands.Network.Models.PSAzureFirewallPolicyIntrusionDetectionSignatureOverride]::new()
-    $o.Id = [UInt64]$it.Id
-    $o.Mode = [string]$it.Mode   # Off/Alert/Deny accepted values
+ 
+    $o = [PSCustomObject]@{
+    Id   = [UInt64]$it.Id
+    Mode = [string]$it.Mode
+    }
     $sig_overrides.Add($o) | Out-Null
-
+ 
+ 
     if (($i % 2000) -eq 0 -or $i -eq $totalItems) {
         $pct = [math]::Round(($i / $totalItems) * 100, 2)
         Write-Progress -Id $progressId -Activity "Building signature override objects" -Status "$i / $totalItems complete" -PercentComplete $pct
         Write-Host ("Built $i override objects...") -ForegroundColor DarkGray
     }
 }
-
+ 
 Write-Progress -Id $progressId -Activity "Building signature override objects" -Completed
 Write-Host ("Built override objects: " + $sig_overrides.Count) -ForegroundColor Green
-
+ 
 # Retrieve the existing Firewall Policy object (local edit → push once)
 $policyId = "/subscriptions/$subs/resourceGroups/$rg/providers/Microsoft.Network/firewallPolicies/$fwp"
-
+ 
 Write-Host "Retrieving full Firewall Policy object (large policies take time)..." -ForegroundColor Yellow
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 try {
@@ -118,7 +121,7 @@ catch {
 }
 $sw.Stop()
 Write-Host ("Firewall policy retrieved in " + $sw.Elapsed.ToString()) -ForegroundColor DarkGray
-
+ 
 # (Change #2) GlobalMode parameter:
 # - If specified, set it
 # - If not specified, leave it alone (use existing policy mode)
@@ -133,27 +136,27 @@ if (-not [string]::IsNullOrWhiteSpace($GlobalMode)) {
         $effectiveGlobalMode = "Deny"
     }
 }
-
+ 
 # Build intrusion detection configuration with signature overrides
 # New-AzFirewallPolicyIntrusionDetection accepts -SignatureOverride
 Write-Host ("Building intrusion detection configuration (mode: $effectiveGlobalMode)") -ForegroundColor Cyan
 $intrusionDetection = New-AzFirewallPolicyIntrusionDetection -Mode $effectiveGlobalMode -SignatureOverride $sig_overrides.ToArray()
-
+ 
 # Push the updated policy once (do not rely on object property assignment; Set-AzFirewallPolicy supports -IntrusionDetection)
 Write-Host ("Submitting firewall policy update (async job - not waiting)...") -ForegroundColor Cyan
-
+ 
 try {
     $job = Set-AzFirewallPolicy -InputObject $policy -IntrusionDetection $intrusionDetection -AsJob
-
+ 
     Write-Host "Update submitted successfully (job started). Exiting without waiting." -ForegroundColor Green
     Write-Host ("Job Id: {0}" -f $job.Id) -ForegroundColor Yellow
     Write-Host ("Job Name: {0}" -f $job.Name) -ForegroundColor DarkGray
-
+ 
     Write-Host "`nCheck status later with:" -ForegroundColor Cyan
     Write-Host ("  Get-Job -Id {0}" -f $job.Id) -ForegroundColor White
     Write-Host ("  Receive-Job -Id {0} -Keep" -f $job.Id) -ForegroundColor White
     Write-Host ("  (When finished) Remove-Job -Id {0}" -f $job.Id) -ForegroundColor White
-
+ 
     exit 0
 }
 catch {
